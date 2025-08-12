@@ -47,7 +47,7 @@ class ScanConfig:
     max_spread_bps: int = 999999      # Effectively no spread limit
     
     # Volatility filters
-    min_volatility: float = 0.02      # Minimum 2% volatility
+    min_volatility: float = 0.005     # Minimum 0.5% volatility for more opportunities
     max_volatility: float = 999.0     # Effectively no maximum volatility limit
 
 
@@ -212,10 +212,11 @@ class MarketScanner(LoggerMixin):
                 volume_24h = float(ticker['quoteVolume'])
                 price_change_24h = float(ticker['priceChangePercent']) / 100
                 
-                # Apply basic filters
+                # Apply basic filters with debug logging
                 if (price < self.config.min_price or 
                     price > self.config.max_price or
                     volume_24h < self.config.min_24h_volume):
+                    self.logger.debug(f"{symbol} filtered out: price=${price:.2f}, volume=${volume_24h:,.0f}")
                     continue
                 
                 # Calculate volatility (approximation using price change)
@@ -223,12 +224,16 @@ class MarketScanner(LoggerMixin):
                 
                 if (volatility < self.config.min_volatility or 
                     volatility > self.config.max_volatility):
+                    self.logger.debug(f"{symbol} filtered out: volatility={volatility:.3f} (min={self.config.min_volatility})")
                     continue
                 
                 # Get order book for spread calculation
                 spread_bps = await self._calculate_spread(symbol, price)
                 if spread_bps > self.config.max_spread_bps:
+                    self.logger.debug(f"{symbol} filtered out: spread={spread_bps:.2f}bps")
                     continue
+                
+                self.logger.info(f"{symbol} PASSED all filters: price=${price:.2f}, vol={volatility:.3f}, spread={spread_bps:.2f}bps")
                 
                 # Create candidate
                 candidate = MarketCandidate(
