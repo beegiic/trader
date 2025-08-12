@@ -1,0 +1,466 @@
+You are modifying an existing Python repo for an AI-assisted crypto trading bot. Make these changes exactly as specified. Do not invent your own architecture. Keep code clean, typed, and production-ready.
+
+GOAL
+
+* LLM is advisory-only. Deterministic code does scanning, entries, stops, targets, and management.
+* Input to LLM is a tiny numeric state vector (no images, no raw candles).
+* Output from LLM is strict JSON matching our Pydantic schema. If invalid, drop the trade.
+* Trades are placed atomically with SL/TP (“bracket order” semantics). Use reduceOnly for exits.
+* State machine prevents zombie states. TTL for candidates.
+* Risk is enforced by \$risk\_at\_stop = position\_loss\_if\_SL\_hits (you can assume high leverage; we size by stop distance so the loss is bounded). The user knows stop loss ≠ full position risk; implement accordingly.
+
+FILES TO CREATE/EDIT (path relative to repo root)
+
+1. utils/pydantic\_models.py
+
+* Add or replace with these models and enums. Keep it self-contained and importable everywhere.
+
+```python
+from enum import Enum
+from typing import List, Optional, Literal
+from pydantic import BaseModel, Field, conlist, conint, confloat
+
+class Trend(Enum):
+    DOWN = -1
+    FLAT = 0
+    UP = 1
+    STRONG_UP = 2
+    STRONG_DOWN = -2
+
+class Action(str, Enum):
+    OPEN = "OPEN"
+    HOLD = "HOLD"
+    FLAT = "FLAT"
+    CANCEL = "CANCEL"
+
+class Side(str, Enum):
+    LONG = "LONG"
+    SHORT = "SHORT"
+
+class EntryType(str, Enum):
+    MARKET = "market"
+    LIMIT = "limit"
+
+class TimeframeSnapshot(BaseModel):
+    trend: Trend
+    mom: conint(ge=-2, le=2)                 # momentum sign/strength
+    atr_pct: confloat(ge=0, le=5)            # ATR/price * 100
+    rsi: conint(ge=0, le=100)
+    bb_pos: confloat(ge=0, le=1)             # 0=lower band, 1=upper band
+    sr_top_dist_bp: conint(ge=0, le=20000)   # basis points distance to overhead SR
+    sr_bot_dist_bp: conint(ge=0, le=20000)   # bps to support
+    imb5: confloat(ge=0, le=1)               # simple orderbook imbalance 0..1
+    breakout_pending: bool = False
+
+class Fees(BaseModel):
+    taker_bps: conint(ge=0, le=100) = 5
+    maker_bps: conint(ge=0, le=100) = 1
+
+class DecisionInput(BaseModel):
+    decision_id: str
+    symbol: str                               # e.g., "BTCUSDT"
+    tfs: dict                                 # {"1m": TimeframeSnapshot, "5m": ..., "1h": ...}
+    fees: Fees
+    spread_bp: confloat(ge=0, le=100)
+    volatility_regime: Literal["low","medium","high"]
+    funding_bps: Optional[conint(ge=-200, le=200)] = 0
+    oi_5m_chg_pct: Optional[confloat(ge=-50, le=50)] = 0
+    time: str
+
+class StopSpec(BaseModel):
+    price: Optional[confloat(gt=0)]
+    reason: Optional[str] = None
+
+class TPLevel(BaseModel):
+    price: confloat(gt=0)
+    type: Literal["R","ABS"] = "R"           # R multiple or absolute price
+
+class TrailSpec(BaseModel):
+    type: Literal["ATR","SWING","NONE"] = "ATR"
+    mult: Optional[confloat(gt=0, le=5)] = 0.8
+
+class DecisionOutput(BaseModel):
+    action: Action
+    symbol: str
+    side: Optional[Side] = None
+    entry: dict = Field(default_factory=lambda: {"type":"market","price":None})
+    size_pct: confloat(gt=0, le=1) = 0.25     # of allocatable capital for this trade
+    leverage: confloat(gt=1, le=125) = 10
+    stop: Optional[StopSpec] = None
+    tp: conlist(TPLevel, min_items=0, max_items=4) = []
+    trail: TrailSpec = TrailSpec()
+    valid_for_sec: conint(gt=10, le=600) = 90
+    confidence: confloat(ge=0, le=1) = 0.5
+    notes: Optional[str] = None
+```
+
+2. analyzers/features.py
+
+* Implement a FeatureEngine that emits a compact state vector per symbol and timeframe. Quantize everything; no raw candles passed to LLM. Keep helper functions pure.
+
+```python
+from dataclasses import dataclass
+from typing import Dict, Literal
+import numpy as np
+
+from .technical_analysis import ema, rsi, atr, bollinger
+# Assume these exist or implement minimal versions (ema, rsi, atr, bollinger)
+# All inputs are numpy arrays of close/high/low as needed.
+
+TF = Literal["1m","5m","15m","1h"]
+
+@dataclass
+class TFOut:
+    trend:int
+    mom:int
+    atr_pct:float
+    rsi:int
+    bb_pos:float
+    sr_top_dist_bp:int
+    sr_bot_dist_bp:int
+    imb5:float
+    breakout_pending:bool
+
+class FeatureEngine:
+    def __init__(self, tick_size: float):
+        self.tick = tick_size
+
+    def _trend(self, closes, fast=20, slow=100):
+        e1, e2 = ema(closes, fast), ema(closes, slow)
+        if e1[-1] > e2[-1] * 1.003 and e1[-1] > e1[-2]: return 2
+        if e1[-1] > e2[-1]: return 1
+        if e1[-1] < e2[-1] * 0.997 and e1[-1] < e1[-2]: return -2
+        if e1[-1] < e2[-1]: return -1
+        return 0
+
+    def _mom(self, closes, look=10):
+        diff = closes[-1] - closes[-look]
+        return 1 if diff > 0 else (-1 if diff < 0 else 0)
+
+    def _bb_pos(self, closes, period=20, mult=2.0):
+        mid, upper, lower = bollinger(closes, period, mult)
+        c = closes[-1]
+        return float(np.clip((c - lower)/max(upper - lower, 1e-9), 0, 1))
+
+    def _atr_pct(self, highs, lows, closes, period=14):
+        a = atr(highs, lows, closes, period)
+        return float(np.clip(100 * a[-1] / closes[-1], 0, 5))
+
+    def _sr_dists_bp(self, closes):
+        # naive SR via recent swing highs/lows
+        window = closes[-300:]
+        peak = np.max(window)
+        trough = np.min(window)
+        last = closes[-1]
+        top_bp = int(10000 * max(peak - last, 0) / last)
+        bot_bp = int(10000 * max(last - trough, 0) / last)
+        return top_bp, bot_bp
+
+    def _imbalance(self, bids_vol5, asks_vol5):
+        tot = bids_vol5 + asks_vol5
+        return float(0.5 if tot == 0 else np.clip(bids_vol5 / tot, 0, 1))
+
+    def build_tf(self, highs, lows, closes, bids_vol5, asks_vol5) -> TFOut:
+        return TFOut(
+            trend=self._trend(closes),
+            mom=self._mom(closes),
+            atr_pct=self._atr_pct(highs, lows, closes),
+            rsi=int(np.clip(rsi(closes, 14)[-1], 0, 100)),
+            bb_pos=self._bb_pos(closes),
+            sr_top_dist_bp=self._sr_dists_bp(closes)[0],
+            sr_bot_dist_bp=self._sr_dists_bp(closes)[1],
+            imb5=self._imbalance(bids_vol5, asks_vol5),
+            breakout_pending=bool(closes[-1] > np.max(closes[-50:-1])*0.999)
+        )
+
+    def build_state(self, symbol: str, tf_data: Dict[TF, dict], fees_bps:int, spread_bp:float, vol_regime:str, funding_bps:int=0, oi_5m_chg_pct:float=0.0) -> dict:
+        # tf_data: { "1m": {highs,lows,closes,bids_vol5,asks_vol5}, ... }
+        tfs = {}
+        for tf, d in tf_data.items():
+            tfs[tf] = self.build_tf(d["highs"], d["lows"], d["closes"], d["bids_vol5"], d["asks_vol5"]).__dict__
+        return {
+            "symbol": symbol,
+            "tfs": tfs,
+            "fees": {"taker_bps": fees_bps, "maker_bps": max(1, fees_bps//5)},
+            "spread_bp": float(spread_bp),
+            "volatility_regime": vol_regime,
+            "funding_bps": int(funding_bps),
+            "oi_5m_chg_pct": float(oi_5m_chg_pct)
+        }
+```
+
+3. strategies/scalping.py
+
+* Deterministic rules for quick scalps. Output “candidates” (not orders). Candidate includes side, entry type, SL price, TPs, TTL seconds, and rationale. Keep entries mostly market or tight limit.
+
+Logic:
+
+* Use on low/medium volatility for mean-reversion; and on high volatility only if 1m+5m momentum both align for continuation.
+* LONG scalp when 1m bb\_pos <= 0.1, rsi<30, 5m not DOWN trend, and sr\_bot\_dist\_bp small (<300bp). Stop = min(recent swing low, entry - 0.6\*ATR\_1m). TPs at +0.5R and +1.0R. Trail ATR 0.8 after BE at +1R.
+* SHORT scalp symmetric when 1m bb\_pos >= 0.9, rsi>70, 5m not UP trend. Same structure.
+
+Provide code:
+
+```python
+from dataclasses import dataclass
+from typing import List, Optional
+from utils.pydantic_models import Side
+
+@dataclass
+class Candidate:
+    symbol: str
+    side: Side
+    entry_type: str  # "market" or "limit"
+    entry_price: Optional[float]  # None for market
+    stop_price: float
+    tp_R: List[float]            # e.g., [0.5, 1.0]
+    trail_type: str              # "ATR"
+    trail_mult: float
+    ttl_sec: int
+    rationale: str
+
+def build_scalp_candidates(state: dict, last_price: float) -> List[Candidate]:
+    sym = state["symbol"]
+    t1 = state["tfs"]["1m"]; t5 = state["tfs"].get("5m", None)
+    out = []
+    # LONG mean-reversion
+    if t1["bb_pos"] <= 0.1 and t1["rsi"] < 30 and (t5 is None or t5["trend"] >= 0):
+        stop = max(last_price * (1 - 0.006), last_price * (1 - t1["atr_pct"]/100*0.6))
+        out.append(Candidate(sym, Side.LONG, "market", None, stop, [0.5,1.0], "ATR", 0.8, 90, "1m BB low + RSI<30"))
+    # SHORT mean-reversion
+    if t1["bb_pos"] >= 0.9 and t1["rsi"] > 70 and (t5 is None or t5["trend"] <= 0):
+        stop = min(last_price * (1 + 0.006), last_price * (1 + t1["atr_pct"]/100*0.6))
+        out.append(Candidate(sym, Side.SHORT, "market", None, stop, [0.5,1.0], "ATR", 0.8, 90, "1m BB high + RSI>70"))
+    return out
+```
+
+4. strategies/swing\_trading.py
+
+* Deterministic breakout/continuation. Use only when volatility\_regime == "high" and 1h trend agrees with 5m/15m.
+
+Logic:
+
+* LONG breakout if 5m breakout\_pending true, 1h trend >= 1, and 1m mom>=0. Entry = market or limit slightly above last\_price, SL = last swing low or 1.2\*ATR\_5m, TPs 1R/2R, trail ATR 0.8 after +1R.
+* SHORT symmetric.
+
+Provide code similar to scalping’s Candidate with tuned params.
+
+5. core/llm\_coordinator.py
+
+* Replace with provider-agnostic coordinator that receives a DecisionInput and returns DecisionOutput. Do not send raw candles or images. Build a short system prompt and a function/tool schema. If the provider does not support tool-calls, require strict JSON between <json> tags and parse it. Retry once on parse failure; else drop.
+
+Pseudo-implementation:
+
+```python
+import json, time, uuid
+from typing import Optional
+from utils.pydantic_models import DecisionInput, DecisionOutput, Action, Side, EntryType
+
+class LLMCoordinator:
+    def __init__(self, provider: str, api_key: str, max_tokens:int=512, self_consistency:int=1):
+        self.provider = provider
+        self.api_key = api_key
+        self.max_tokens = max_tokens
+        self.n = max(1, self_consistency)
+
+    def build_prompt(self, di: DecisionInput) -> str:
+        # concise, numeric-only
+        return (
+            "You are a trading strategist. Decide approval and minor parameter tuning.\n"
+            "Only return JSON matching the DecisionOutput schema. No text.\n"
+            f"Input: {di.model_dump_json()}\n"
+            "Rules: If setup aligns across TFs and costs are acceptable, action=OPEN; else CANCEL/FLAT.\n"
+            "Entry default market, size_pct<=0.5, leverage<=25 unless atr_pct<0.3.\n"
+            "Stop must be present when action=OPEN. tp: 1-3 levels, e.g., 0.5R and 1.0R.\n"
+            "valid_for_sec<=120.\n"
+        )
+
+    def _call(self, prompt:str) -> Optional[DecisionOutput]:
+        # implement OpenAI/Anthropic call; for non-tool providers expect pure JSON in response.
+        # parse strictly; on failure return None
+        raw = self._provider_call(prompt)    # implement separately
+        try:
+            if "<json>" in raw:
+                raw = raw.split("<json>")[1].split("</json>")[0]
+            data = json.loads(raw)
+            return DecisionOutput(**data)
+        except Exception:
+            return None
+
+    def propose(self, di: DecisionInput) -> Optional[DecisionOutput]:
+        for _ in range(self.n):
+            out = self._call(self.build_prompt(di))
+            if out:
+                if out.symbol != di.symbol: continue
+                return out
+        return None
+```
+
+6. core/trade\_manager.py
+
+* Own the pipeline: collect candidates from strategies, build DecisionInput, ask LLM only on shortlisted candidates, apply risk sizing, and pass to execution upon approval (manual or auto).
+
+Key behavior:
+
+* States: IDLE -> CANDIDATE -> APPROVED/REJECTED -> PENDING\_ENTRY -> OPEN -> MANAGED -> CLOSED/CANCELLED
+* Each candidate has TTL (valid\_for\_sec). If expired before approval, cancel.
+* Human-in-the-loop via Matrix. Also allow `/auto on size<=X confidence>=Y` gates.
+
+Add code stubs to hold and advance state. Ensure a unique decision\_id is used end-to-end.
+
+7. core/execution.py
+
+* Implement place\_bracket\_order(symbol, side, entry\_type, entry\_price, stop\_price, tp\_prices\[], reduce\_only=True).
+* For Binance Futures: use STOP\_MARKET for SL (reduceOnly), TAKE\_PROFIT\_MARKET or LIMIT for TP(s) (reduceOnly). If any leg fails to place, cancel the entry. Round all prices/qty with order\_constraints.
+
+Sizing rule (important and matches the user’s view):
+
+* risk\_amount = equity \* risk\_per\_trade (config-driven)
+* stop\_distance = abs(entry\_price - stop\_price)
+* qty = risk\_amount / stop\_distance (include fees+slippage buffer, e.g., 1.2x)
+* leverage is whatever margin implies; still cap by leverage\_cap from config.
+* This means even with high nominal leverage, actual risk equals risk\_amount because SL exits near stop\_price.
+
+Provide a helper:
+
+```python
+def compute_qty_from_risk(equity_usd, risk_pct, entry_price, stop_price, fee_bps=5, slippage_bp=2):
+    risk_amount = equity_usd * risk_pct
+    stop_dist = abs(entry_price - stop_price)
+    gross_qty = risk_amount / max(stop_dist, 1e-9)
+    # buffer for fees+slippage
+    return gross_qty * (1 - (fee_bps + slippage_bp)/10000.0)
+```
+
+8. core/state\_machine.py
+
+* Implement a simple typed enum for states and a class with transition methods. If websocket disconnects or constraints fail, gracefully cancel or flatten as configured. No zombie states.
+
+9. core/matrix\_client.py
+
+* Add message builder that shows: symbol, side, entry, SL, TPs, size (USD and qty), R/R, valid\_for, confidence, decision\_id with Approve/Reject buttons. If TTL expires, auto-cancel and inform the room.
+
+10. strategies/risk\_manager.py
+
+* Enforce pre-trade hard checks before LLM is called:
+
+  * symbol allowlist
+  * max open positions (if configured)
+  * max leverage\_cap
+  * max portfolio heat
+  * daily loss halt
+    Return explicit reason codes if a candidate is blocked.
+
+11. analyzers/market\_scanner.py
+
+* Keep universe tiny: BTCUSDT and ETHUSDT only at first, ranked by liquidity/spread. Scan intervals per config.
+
+12. backtester/engine.py and backtester/paper\_trader.py
+
+* Ensure they import the same candidate builders, risk sizing, and execution logic to achieve parity. Simulate taker fees, spread, funding, and simple slippage.
+
+13. utils/formatters.py and utils/notifications.py
+
+* Update to include decision\_id and trace\_id through the entire pipeline.
+* Log structured JSON: state\_vector\_in, llm\_json\_out, risk\_checks, orders\_sent, fills, PnL.
+
+14. tests/
+
+* tests/test\_llm\_schema.py: fuzz invalid fields; assert DecisionOutput validates or fails closed.
+* tests/test\_order\_constraints.py: price/qty rounding, min notional, OCO integrity.
+* tests/test\_risk\_manager.py: daily loss halt, heat cap, leverage cap, per-trade risk sizing vs stop distance.
+
+TRADING RULES (deterministic; Claude must encode these exactly)
+
+General
+
+* Universe: BTCUSDT, ETHUSDT (futures or spot-perp). Focus on top liquidity.
+* Timeframes used: 1m, 5m, 15m, 1h.
+* Costs: skip any trade if spread\_bp > 2.0 or taker\_bps >= 10 (configurable).
+* Volatility regime:
+
+  * high if atr\_pct(1m) > 0.4 or atr\_pct(5m) > 0.35
+  * low if atr\_pct(1m) < 0.2 and atr\_pct(5m) < 0.18
+  * otherwise medium
+* Position sizing: size by \$risk at stop (not by leverage). leverage is derived from margin; still cap leverage<=config.leverage\_cap.
+
+Scalping (mean-reversion default; continuation only in high vol)
+
+* LONG scalp conditions:
+
+  * 1m bb\_pos ≤ 0.10, 1m rsi < 30
+  * 5m trend >= 0 (not down)
+  * sr\_bot\_dist\_bp ≤ 300
+  * Entry: market at last\_price (or limit within 2 bp)
+  * Stop: min(recent swing low, entry - 0.6 \* ATR\_1m \* price)
+  * TP1: +0.5R, TP2: +1.0R
+  * Management: at +1.0R, move SL to breakeven; then trail ATR with mult=0.8
+* SHORT scalp conditions:
+
+  * 1m bb\_pos ≥ 0.90, 1m rsi > 70
+  * 5m trend <= 0 (not up)
+  * sr\_top\_dist\_bp ≤ 300
+  * Entry/Stop/TPs/Management mirrored
+
+Breakout/Continuation (5m/15m with 1h alignment; use only medium/high vol)
+
+* LONG breakout:
+
+  * 5m breakout\_pending true
+  * 1h trend ≥ 1
+  * 1m mom ≥ 0
+  * Entry: market or limit slightly above last\_price (e.g., +1 bp)
+  * Stop: last 5m swing low or 1.2×ATR\_5m below entry
+  * TP1: +1.0R, TP2: +2.0R
+  * Management: at +1.0R set SL to BE; trail ATR(5m) with mult=0.8
+* SHORT breakout mirrored
+
+Timing and TTL
+
+* Any candidate has valid\_for\_sec between 60 and 120. If not approved in time, cancel.
+* Time-out exit: if after entry price does not move +0.3R within 15 minutes on scalps (or 60 minutes on swing), close at market.
+
+LLM usage
+
+* We never ask the model to invent trades. We only ask it to approve and possibly tune size\_pct, leverage (within caps), and confirm side and whether to OPEN vs CANCEL.
+* Prompt includes only the numeric state vector and candidate summary. No screenshots, no candle arrays.
+
+Risk profile “challenge”
+
+* risk\_per\_trade default 0.05 (5% of equity per trade, expressed as loss if SL hits).
+* daily loss limit 0.15
+* heat cap 0.25
+* leverage cap 25
+* auto-approval off by default; can be toggled by Matrix command if confidence≥0.7 and per-trade notional≤configured limit.
+
+EXACT INTEGRATION FLOW (implement in trade\_manager)
+
+1. market\_scanner selects BTCUSDT, ETHUSDT
+2. for each symbol, pull latest OHLCV arrays and orderbook snapshot
+3. features.build\_state -> compact dict
+4. strategies.scalping.build\_scalp\_candidates + strategies.swing\_trading.build\_swing\_candidates -> list\[Candidate]
+5. for each Candidate:
+   a) compile DecisionInput from features + candidate summary
+   b) pre-check risk\_manager (symbol, heat, daily halt, leverage cap)
+   c) call LLMCoordinator.propose(di)
+   d) if DecisionOutput.action != OPEN -> drop
+   e) compute final position qty via compute\_qty\_from\_risk(equity, risk\_pct, entry\_price, stop\_price)
+   f) pass to execution.place\_bracket\_order
+6. on fills, transition to OPEN -> MANAGED; manage trailing/BE moves via deterministic rules
+7. on exit fill, close and log; update performance
+
+CONFIG
+
+* config/market\_settings.yaml: set symbols allowlist \["BTCUSDT","ETHUSDT"], scan\_interval\_minutes 1-5 for live, 30 for dev; set default risk profile keys mentioned above.
+
+TESTS
+
+* Add quick fixtures for a fake symbol with synthetic candles to hit each rule path.
+* Ensure invalid LLM JSON results in a skipped trade (no order calls).
+
+NOTES
+
+* Do not send or parse screenshots. Never send raw candle arrays to the LLM.
+* Keep all messages logged with decision\_id and trace\_id from scanner -> LLM -> risk -> execution.
+
+Please implement all of the above now. Do not omit files. Keep changes minimal and isolated to the listed files unless a missing import requires small edits elsewhere.

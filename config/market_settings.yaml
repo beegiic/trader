@@ -1,41 +1,88 @@
+# Market settings for deterministic trading system
+symbols:
+  allowlist:
+    - "BTCUSDT" 
+    - "ETHUSDT"
+  
+  # Focus on top liquidity pairs only
+  criteria:
+    min_24h_volume: 1000000000  # $1B minimum
+    max_spread_bps: 2.0
+    
+scanner:
+  # Fast scanning for live trading, slower for development  
+  scan_interval_minutes: 2
+  dev_scan_interval_minutes: 30
+  
+  # Timeframes to collect
+  timeframes:
+    - "1m"
+    - "5m" 
+    - "15m"
+    - "1h"
+  
+  # Market data lookback
+  lookback_periods: 200
+
+volatility:
+  # Volatility regime classification
+  high_atr_1m_threshold: 0.4    # > 0.4% ATR = high vol
+  high_atr_5m_threshold: 0.35   # > 0.35% ATR = high vol  
+  low_atr_1m_threshold: 0.2     # < 0.2% ATR = low vol
+  low_atr_5m_threshold: 0.18    # < 0.18% ATR = low vol
+  # Between thresholds = medium vol
+
+costs:
+  # Skip trades if costs too high
+  max_spread_bp: 2.0
+  max_taker_bps: 10
+
+risk_profile_challenge:
+  # Challenge mode: grow $100 to $100k
+  risk_per_trade: 0.05      # 5% of equity per trade (at stop loss)
+  daily_loss_limit: 0.15   # 15% max daily loss
+  heat_cap: 0.25           # 25% max portfolio heat  
+  leverage_cap: 25         # Max 25x leverage
+  
+  # Auto-approval settings
+  auto_approval:
+    enabled: false         # Require manual approval by default
+    max_confidence: 0.7    # Only auto-approve if confidence >= 70%
+    max_notional_usd: 2000 # Only auto-approve if position <= $2000
+
+timing:
+  # Trade timing and TTL
+  min_candidate_ttl_sec: 60
+  max_candidate_ttl_sec: 120
+  
+  # Time-based exits  
+  scalp_timeout_minutes: 15    # Close scalp if no movement in 15min
+  swing_timeout_minutes: 60    # Close swing if no movement in 60min
+  
+  # R-based management
+  scalp_trail_start_r: 1.0     # Start trailing SL at +1R for scalps
+  swing_trail_start_r: 1.0     # Start trailing SL at +1R for swings
+
+# Legacy compatibility
 risk:
-  risk_per_trade: 0.01
-  max_daily_loss: 0.05
-  heat_cap: 0.1
-  leverage_cap: 3
+  risk_per_trade: 0.05  # Updated for challenge mode
+  max_daily_loss: 0.15
+  heat_cap: 0.25
+  leverage_cap: 25
   require_double_confirm: false
 
 market:
-  top_symbols_count: 5
-  min_24h_volume: 1000000
-  max_spread_bps: 20
-  scan_interval_minutes: 30
-
-briefing:
-  enabled: true
-  time_local: "07:00"
-  timezone: "Europe/Ljubljana"
-  symbols: 
-    - "BTCUSDT"
-    - "ETHUSDT"
-  include_futures_calendar: true
-
-tavily:
-  enabled: false
-  freshness_days: 2
-  per_symbol_queries: 3
-  max_requests_per_day: 60
-  query_templates:
-    - "latest news {symbol} price drivers"
-    - "{symbol} funding, liquidation clusters, derivatives sentiment"
-    - "crypto market risk today macro events"
+  top_symbols_count: 2  # Only BTC/ETH
+  min_24h_volume: 1000000000
+  max_spread_bps: 2
+  scan_interval_minutes: 2
 
 llm:
   use_ensemble: false
-  consistency_samples: 3
+  consistency_samples: 1  # Single decision for speed
   primary_model: "gpt-5"
   
 trading:
-  default_mode: "conservative"
-  auto_approve_max_size: 100
-  auto_approve_min_confidence: 0.8
+  default_mode: "challenge"  # Updated to challenge mode
+  auto_approve_max_size: 2000
+  auto_approve_min_confidence: 0.7
