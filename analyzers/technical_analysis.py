@@ -116,9 +116,9 @@ class TechnicalAnalyzer(LoggerMixin):
         self.llm_coordinator = llm_coordinator
         self.risk_manager = risk_manager
         
-        # Analysis configuration
-        self.timeframes = ['5m', '15m', '1h', '4h', '1d']
-        self.main_timeframe = '15m'
+        # Analysis configuration - include faster timeframes for scalping
+        self.timeframes = ['1m', '5m', '15m', '1h', '4h', '1d']
+        self.main_timeframe = '5m'  # Changed to 5m for more opportunities
         self.lookback_periods = 100
         
         self.logger.info("Technical analyzer initialized")
@@ -467,7 +467,7 @@ class TechnicalAnalyzer(LoggerMixin):
     async def _multi_timeframe_analysis(self, symbol: str) -> Dict[str, Any]:
         """Comprehensive multi-timeframe analysis for GPT-5"""
         try:
-            timeframes = ['5m', '15m', '1h', '4h']
+            timeframes = ['1m', '5m', '15m', '1h', '4h']  # Added 1m for scalping
             context = {}
             
             for tf in timeframes:

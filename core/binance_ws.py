@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import websockets
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -51,7 +52,8 @@ class BinanceWebSocket(LoggerMixin):
         
         # Connection management
         self.websocket: Optional[websockets.WebSocketServerProtocol] = None
-        self.is_connected = False
+        self._connected = False
+        self._conn = None  # underlying ws/session/stream handle
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
         
@@ -73,6 +75,39 @@ class BinanceWebSocket(LoggerMixin):
         
         self.logger.info("Binance WebSocket client initialized", testnet=testnet, futures=futures)
     
+    def _on_open(self, conn):
+        """Called when WebSocket connection is established."""
+        self._conn = conn
+        self._connected = True
+
+    def _on_close(self):
+        """Called when WebSocket connection is closed."""
+        self._connected = False
+        self._conn = None
+
+    def is_connected(self) -> bool:
+        """
+        Robust check that doesn't assume a specific library attribute.
+        """
+        try:
+            if self._connected is False:
+                return False
+            c = self._conn or self.websocket
+            if c is None:
+                return False
+            # common cases:
+            # - websockets client: hasattr(c, "closed")
+            # - aiohttp ws: hasattr(c, "closed")
+            closed_attr = getattr(c, "closed", None)
+            if isinstance(closed_attr, bool):
+                return not closed_attr
+            if callable(closed_attr):
+                return not bool(closed_attr())
+            # fallback: assume alive if no explicit 'closed'
+            return True
+        except Exception:
+            return False
+    
     async def connect(self):
         """Establish WebSocket connection."""
         try:
@@ -85,7 +120,7 @@ class BinanceWebSocket(LoggerMixin):
                 ping_timeout=10,
                 close_timeout=10
             )
-            self.is_connected = True
+            self._on_open(self.websocket)
             self.reconnect_attempts = 0
             
             self.logger.info("WebSocket connected", url=stream_url)
@@ -95,12 +130,12 @@ class BinanceWebSocket(LoggerMixin):
             
         except Exception as e:
             self.logger.error("Failed to connect to WebSocket", error=str(e))
-            self.is_connected = False
+            self._on_close()
             raise
     
     async def disconnect(self):
         """Close WebSocket connection."""
-        self.is_connected = False
+        self._on_close()
         if self.websocket:
             await self.websocket.close()
             self.websocket = None
@@ -120,11 +155,11 @@ class BinanceWebSocket(LoggerMixin):
                     
         except websockets.exceptions.ConnectionClosed:
             self.logger.warning("WebSocket connection closed")
-            self.is_connected = False
+            self._on_close()
             await self._handle_reconnection()
         except Exception as e:
             self.logger.error("Error in message handler", error=str(e))
-            self.is_connected = False
+            self._on_close()
             await self._handle_reconnection()
     
     async def _handle_reconnection(self):
@@ -293,7 +328,7 @@ class BinanceWebSocket(LoggerMixin):
             if callback:
                 self.callbacks[stream].append(callback)
             
-            if self.is_connected:
+            if self.is_connected():
                 subscribe_msg = {
                     "method": "SUBSCRIBE",
                     "params": [stream],
@@ -313,7 +348,7 @@ class BinanceWebSocket(LoggerMixin):
             if stream in self.callbacks:
                 del self.callbacks[stream]
             
-            if self.is_connected:
+            if self.is_connected():
                 unsubscribe_msg = {
                     "method": "UNSUBSCRIBE",
                     "params": [stream],
@@ -360,7 +395,7 @@ class BinanceWebSocket(LoggerMixin):
     def health_check(self) -> Dict[str, Any]:
         """Get WebSocket health status."""
         return {
-            'connected': self.is_connected,
+            'connected': self.is_connected(),
             'subscriptions_count': len(self.subscriptions),
             'symbols_with_book_data': len(self.book_tickers),
             'reconnect_attempts': self.reconnect_attempts,

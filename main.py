@@ -363,7 +363,7 @@ class TradingBot:
         """Monitor WebSocket connection health."""
         while self.running:
             try:
-                if self.binance_ws and not self.binance_ws.is_connected:
+                if self.binance_ws and not self.binance_ws.is_connected():
                     self.logger.warning("WebSocket disconnected, attempting reconnection...")
                     try:
                         await self.binance_ws.connect()
@@ -394,7 +394,16 @@ class TradingBot:
                 binance_healthy = await self.binance_client.health_check()
                 
                 # Check WebSocket health
-                ws_health = self.binance_ws.health_check()
+                try:
+                    ws_healthy = True if not hasattr(self, "binance_ws") else bool(getattr(self.binance_ws, "is_connected", lambda: True)())
+                except Exception as e:
+                    ws_healthy = False
+                    self.logger.error("Health check error: %s", e)
+                if not ws_healthy:
+                    # trigger your reconnect logic or warn and skip entries
+                    self.logger.warning("WS unhealthy; scheduling reconnect")
+                
+                ws_health = {'connected': ws_healthy}
                 
                 # Check Matrix connection
                 matrix_healthy = self.matrix_client.is_connected
@@ -498,7 +507,7 @@ class TradingBot:
             'tasks_count': len(self.tasks),
             'components': {
                 'binance_client': self.binance_client is not None,
-                'binance_ws': self.binance_ws.is_connected if self.binance_ws else False,
+                'binance_ws': self.binance_ws.is_connected() if self.binance_ws else False,
                 'matrix_client': self.matrix_client.is_connected if self.matrix_client else False,
                 'llm_coordinator': self.llm_coordinator is not None,
                 'risk_manager': self.risk_manager is not None

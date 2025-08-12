@@ -5,7 +5,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float, DateTime, 
-    Boolean, Text, JSON, ForeignKey, Index, UniqueConstraint
+    Boolean, Text, JSON, ForeignKey, Index, UniqueConstraint, text
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
@@ -322,7 +322,7 @@ class DatabaseManager:
         """Check database connectivity."""
         try:
             with self.get_session() as session:
-                session.execute("SELECT 1")
+                session.execute(text("SELECT 1"))
                 return True
         except Exception as e:
             logger.error("Database health check failed", error=str(e))

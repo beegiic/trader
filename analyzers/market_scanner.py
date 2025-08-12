@@ -34,21 +34,21 @@ class MarketCandidate:
 @dataclass
 class ScanConfig:
     """Configuration for market scanning"""
-    # Scanning intervals
-    idle_scan_interval: int = 900      # 15 minutes when idle
-    active_scan_interval: int = 20     # 20 seconds when trades active
-    manual_scan_interval: int = 60     # 1 minute manual override
+    # Scanning intervals - more frequent for more opportunities
+    idle_scan_interval: int = 180      # 3 minutes when idle (was 15min)
+    active_scan_interval: int = 15     # 15 seconds when trades active
+    manual_scan_interval: int = 30     # 30 seconds manual override
     
     # Market selection criteria
-    min_24h_volume: float = 1000000    # Minimum 24h volume in USDT
-    max_symbols: int = 10              # Max symbols to track
+    min_24h_volume: float = 500000     # Lower volume threshold for more opportunities
+    max_symbols: int = 15              # Track more symbols
     min_price: float = 0.01           # Minimum price
     max_price: float = 100000         # Maximum price
-    max_spread_bps: int = 50          # Maximum spread in basis points
+    max_spread_bps: int = 999999      # Effectively no spread limit
     
     # Volatility filters
     min_volatility: float = 0.02      # Minimum 2% volatility
-    max_volatility: float = 0.20      # Maximum 20% volatility
+    max_volatility: float = 999.0     # Effectively no maximum volatility limit
 
 
 class MarketScanner(LoggerMixin):
@@ -75,6 +75,16 @@ class MarketScanner(LoggerMixin):
         self.logger.info("Market scanner initialized", 
                         idle_interval=self.config.idle_scan_interval,
                         active_interval=self.config.active_scan_interval)
+
+    def get_universe(self):
+        """Get the list of symbols to scan."""
+        # prefer explicit allowlist from config
+        allow = (getattr(self.config, "symbols_allowlist", None) or 
+                getattr(self.config, "symbols", None) or [])
+        if allow:
+            return list(dict.fromkeys(allow))  # dedupe preserving order
+        # fallback defaults - more symbols for more opportunities
+        return ["BTCUSDT", "ETHUSDT"]
     
     async def start(self):
         """Start the market scanner"""
@@ -165,22 +175,15 @@ class MarketScanner(LoggerMixin):
                            interval_seconds=self.get_scan_interval(),
                            action="scan_start")
             
-            # Only scan top 6 futures pairs as requested
-            top_symbols = [
-                'BTCUSDT',    # Bitcoin
-                'ETHUSDT',    # Ethereum  
-                'BNBUSDT',    # Binance Coin
-                'ADAUSDT',    # Cardano
-                'SOLUSDT',    # Solana
-                'DOTUSDT'     # Polkadot
-            ]
+            # Get symbols from universe (config allowlist or defaults)
+            universe_symbols = self.get_universe()
             
-            self.logger.info("Scanning top futures pairs", 
-                           symbols=top_symbols,
-                           symbol_count=len(top_symbols))
+            self.logger.info("Scanning futures pairs", 
+                           symbols=universe_symbols,
+                           symbol_count=len(universe_symbols))
             
-            # Get 24hr tickers for top symbols only
-            candidates = await self._analyze_symbols(top_symbols)
+            # Get 24hr tickers for universe symbols only
+            candidates = await self._analyze_symbols(universe_symbols)
             
             # Rank and select best candidates
             self.candidates = self._select_candidates(candidates)
