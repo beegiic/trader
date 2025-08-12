@@ -1,0 +1,41 @@
+risk:
+  risk_per_trade: 0.01
+  max_daily_loss: 0.05
+  heat_cap: 0.1
+  leverage_cap: 3
+  require_double_confirm: false
+
+market:
+  top_symbols_count: 5
+  min_24h_volume: 1000000
+  max_spread_bps: 20
+  scan_interval_minutes: 30
+
+briefing:
+  enabled: true
+  time_local: "07:00"
+  timezone: "Europe/Ljubljana"
+  symbols: 
+    - "BTCUSDT"
+    - "ETHUSDT"
+  include_futures_calendar: true
+
+tavily:
+  enabled: false
+  freshness_days: 2
+  per_symbol_queries: 3
+  max_requests_per_day: 60
+  query_templates:
+    - "latest news {symbol} price drivers"
+    - "{symbol} funding, liquidation clusters, derivatives sentiment"
+    - "crypto market risk today macro events"
+
+llm:
+  use_ensemble: false
+  consistency_samples: 3
+  primary_model: "gpt-5"
+  
+trading:
+  default_mode: "conservative"
+  auto_approve_max_size: 100
+  auto_approve_min_confidence: 0.8

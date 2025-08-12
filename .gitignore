@@ -1,0 +1,89 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+.env/
+
+# Environment variables and secrets
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+bot.db
+
+# Log files
+*.log
+logs/
+startup_debug.log
+bot_output.log
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+.tmp/
+.temp/
+
+# API keys and secrets
+*secret*
+*key*
+*token*
+!requirements.txt
+
+# Trading specific
+trades.json
+positions.json
+backtest_results/
+
+# System service files (keep the template but not runtime files)
+*.service.active
+
+# Cache
+.cache/
+*.cache

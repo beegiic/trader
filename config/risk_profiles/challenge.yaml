@@ -1,0 +1,43 @@
+# Challenge Profile - High Risk Trading Profile
+# Use with extreme caution and only with funds you can afford to lose
+
+risk:
+  risk_per_trade: 0.10          # 10% per trade (extreme risk)
+  max_daily_loss: 0.25          # 25% daily loss limit
+  heat_cap: 0.40                # 40% portfolio heat cap
+  leverage_cap: 20              # Up to 20x leverage
+  require_double_confirm: true  # Require double confirmation for safety
+
+market:
+  top_symbols_count: 10         # More symbols for opportunities
+  min_24h_volume: 500000        # Lower volume threshold
+  max_spread_bps: 50            # Allow higher spreads
+  scan_interval_minutes: 15     # More frequent scanning
+
+trading:
+  default_mode: "aggressive"
+  auto_approve_max_size: 1000
+  auto_approve_min_confidence: 0.7
+
+# Challenge-specific settings
+challenge:
+  name: "Extreme Risk Challenge"
+  description: "Maximum risk trading profile for experienced traders only"
+  warnings:
+    - "EXTREME RISK: 10% position size, 20x leverage"
+    - "Can lose entire account quickly"
+    - "Only use with money you can afford to lose completely"
+    - "Requires constant monitoring"
+    - "High leverage amplifies both gains and losses"
+  
+# Override briefing for challenge mode
+briefing:
+  enabled: true
+  time_local: "06:00"  # Earlier brief for active trading
+  timezone: "Europe/Ljubljana"
+  symbols:
+    - "BTCUSDT"
+    - "ETHUSDT" 
+    - "ADAUSDT"
+    - "SOLUSDT"
+    - "DOTUSDT"

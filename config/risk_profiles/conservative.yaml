@@ -1,0 +1,39 @@
+# Conservative Profile - Low Risk Trading Profile
+# Suitable for steady growth with minimal drawdown risk
+
+risk:
+  risk_per_trade: 0.005         # 0.5% per trade (very low)
+  max_daily_loss: 0.02          # 2% daily loss limit
+  heat_cap: 0.05                # 5% portfolio heat cap
+  leverage_cap: 2               # Maximum 2x leverage
+  require_double_confirm: false
+
+market:
+  top_symbols_count: 3          # Focus on top liquid pairs
+  min_24h_volume: 2000000       # Higher volume requirement
+  max_spread_bps: 10            # Tight spreads only
+  scan_interval_minutes: 60     # Less frequent scanning
+
+trading:
+  default_mode: "conservative"
+  auto_approve_max_size: 50     # Small auto-approve limit
+  auto_approve_min_confidence: 0.9  # High confidence required
+
+# Conservative-specific settings
+conservative:
+  name: "Conservative Profile" 
+  description: "Low risk profile focused on capital preservation"
+  features:
+    - "Very low risk per trade (0.5%)"
+    - "Tight daily loss limits (2%)"
+    - "High liquidity requirements"
+    - "High confidence thresholds"
+  
+# Override briefing for conservative mode  
+briefing:
+  enabled: true
+  time_local: "08:00"  # Later brief, less urgent
+  timezone: "Europe/Ljubljana"
+  symbols:
+    - "BTCUSDT"
+    - "ETHUSDT"

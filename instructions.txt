@@ -1,0 +1,155 @@
+Step 1 — Bootstrap Project & Environment
+- Create structure:
+  core/{binance_client.py,binance_ws.py,order_constraints.py,execution.py,state_machine.py,matrix_client.py,llm_coordinator.py,trade_manager.py}
+  analyzers/{market_scanner.py,features.py,technical_analysis.py,sentiment_analysis.py}
+  strategies/{scalping.py,swing_trading.py,risk_manager.py}
+  utils/{database.py,logging_config.py,pydantic_models.py,notifications.py,formatters.py}
+  backtester/{engine.py,paper_trader.py}
+  tests/{test_risk_manager.py,test_order_constraints.py,test_llm_schema.py}
+- requirements.txt: python-binance, aiohttp, websockets, numpy, pandas, pandas_ta, pydantic, structlog, sqlalchemy, python-dotenv, pyyaml, tenacity, apscheduler, matrix-nio, openai, anthropic
+  (+ tavily client or simple aiohttp wrapper)
+- .env:
+  BINANCE_API_KEY=..., BINANCE_SECRET_KEY=..., BINANCE_USE_TESTNET=true|false
+  BINANCE_FUTURES=true|false
+  MATRIX_HOMESERVER=..., MATRIX_ACCESS_TOKEN=..., MATRIX_ROOM_ID=...
+  OPENAI_API_KEY=..., ANTHROPIC_API_KEY=..., GROK_API_KEY=... (optional)
+  DATABASE_URL=sqlite:///bot.db
+  TAVILY_API_KEY=... (optional), TAVILY_ENABLE=true|false
+  BRIEF_TIME_LOCAL=07:00, BRIEF_TIMEZONE=Europe/Ljubljana
+- utils/logging_config.py: structlog JSON with trace IDs; rotating file + console.
+- utils/pydantic_models.py:
+  • Config schemas (strategy, risk, market, briefing, tavily) + YAML loader with env overrides.
+  • LLMInput (numeric features only) and LLMOutput (strict action schema).
+  • HumanProposal {summary_text, decision: LLMOutput}.
+  • BriefSection/BriefDocument schemas for the daily brief.
+- utils/database.py: tables: trades, orders, positions, decisions, risk_events, feature_snapshots, performance, news_items (from Tavily), daily_briefs.
+
+Step 2 — Exchange, Chat, Scheduling, and Help
+- core/binance_client.py (REST): get_klines(), get_exchange_info(), get_account(), get_positions(), place_order(), place_test_order() — all pass order_constraints + risk_manager.
+- core/binance_ws.py (WS): subscribe to bookTicker, trades, depth; keep in-memory top-of-book & rolling OHLCV per timeframe.
+- core/order_constraints.py: tick/step/minNotional validation & rounding.
+- core/matrix_client.py:
+  • Commands:
+    /help — list commands with examples
+    /mode <aggressive|conservative>
+    /profile load <name>
+    /set risk_per_trade <pct>
+    /set max_daily_loss <pct>
+    /set heat_cap <pct>
+    /set leverage_cap <x>
+    /auto on size<=<usd> confidence>=<x> | /auto off
+    /approve <decision_id> | /reject <decision_id>
+    /exit <symbol> | /move_sl <symbol> <price>
+    /flatten | /halt | /resume
+    /portfolio | /recent
+    /brief — generate an immediate daily brief
+    /brief schedule <HH:MM> — set local briefing time
+    /brief symbols add|remove <SYMBOL> | /brief symbols list
+  • Render proposals & briefs via utils/formatters.py (human first, JSON details below).
+- Scheduling:
+  • APScheduler cron job for daily brief at BRIEF_TIME_LOCAL in BRIEF_TIMEZONE (Europe/Ljubljana).
+  • On schedule change, reschedule safely.
+
+Step 3 — Features, Indicators, Scanning, Sentiment
+- analyzers/market_scanner.py: every 30m select top N=5 by 24h quote volume, average spread, (futures) funding sanity; maintain allowlist.
+- analyzers/technical_analysis.py: RSI, MACD, BB, EMA(20/200), ATR, trend filter (on server, not in LLM).
+- analyzers/features.py: build compact feature bundle {bid, ask, spread_bps, last_trade_ts, ohlcv_tails[1m/5m/1h], indicators, realized_vol, funding_rate?, fees_bps, slippage_bps, account_context}. Persist snapshot.
+- analyzers/sentiment_analysis.py (optional via TAVILY_ENABLE):
+  • For each briefed symbol and “crypto market”, execute Tavily queries with freshness filter & budget limits; dedupe by URL/domain; cache results (DB).
+  • Output per symbol: sentiment_score [-1..1], top_headlines [{title, source, age_hours, url_hash}], risk_keywords (e.g., hack, regulatory, ETF, liquidation).
+  • NEVER place trades from news alone; only adjust bias/filters.
+
+Step 4 — Decision System, Human Briefs, Risk Gate, Execution
+- strategies/risk_manager.py: hard gate (per-trade risk %, daily loss %, portfolio heat %, leverage cap, allowlist). Resize or reject. Emit risk_events. Support /flatten & /halt.
+- core/llm_coordinator.py:
+  • Inputs: sanitized LLMInput (numbers only), include fees_bps & slippage_bps; include summarized sentiment (score, key headlines) but not raw links.
+  • Option A (default): self-consistency with one model (N samples → vote/mean; reject if variance high).
+  • Option B: multi-LLM ensemble (OpenAI + Anthropic + optional Grok if GROK_API_KEY present). Tie-break rules.
+  • Outputs: LLMOutput (strict Pydantic). On invalid JSON → one reprompt → else reject. Also create `summary_text` (human brief for proposals).
+- utils/formatters.py:
+  • Build human-readable proposal: Setup, Entry, SL/TP, size, R/R, Confidence, Why now, Risk flags; append compact JSON block.
+  • Build **daily brief** sections per symbol: Trend/Levels, Liquidity, Setups Today, Sentiment/News (score + top bullets), Risk Flags, Calendar/Funding.
+- core/execution.py: orders (limit/market/TWAP); OCO for SL/TP; partial fills; clientOrderId; retries (tenacity); include fees+slippage in PnL.
+- core/trade_manager.py: lifecycle SCANNING→PROPOSAL→AWAIT_APPROVAL→EXECUTION→MONITOR→EXIT. Store human+JSON, approvals, fills, outcome.
+
+Step 5 — Main Loop, Ops, Safety, and Challenge Profile
+- main.py: async tasks for WS consumers, periodic scanner, feature builder, decision engine, Matrix listener; APScheduler for daily brief at BRIEF_TIME_LOCAL (Europe/Ljubljana).
+- Circuit breakers: on max_daily_loss hit → HALT & alert; /halt and /flatten immediate.
+- /help: show commands, current mode/profile, auto-approve status, brief schedule, covered symbols.
+- challenge profile (config/risk_profiles/challenge.yaml): very high risk; require_double_confirm=true. Command: `/profile load challenge` (bot asks to /approve again).
+- Graceful shutdown: cancel tasks, close sockets, persist caches, cancel IOC orders if needed.
+- README: testnet/paper instructions, command cheat-sheet, daily brief behavior, Tavily limits, Grok optionality.
+
+If you want, I can draft sentiment_analysis.py (Tavily wrapper with caching + scoring) and the /help renderer so you can drop them straight in.
+
+What’s new (delta)
+	•	Daily Briefing (07:00 CET/CEST): APScheduler cron job builds a morning brief per tracked symbol:
+	•	Market context (trend, key levels, volatility/ATR, liquidity/spread).
+	•	“What to watch today” (setups likely to trigger, invalidation levels).
+	•	Sentiment/News via Tavily (optional): summarized headlines, sentiment score, risk flags.
+	•	Calendar/funding reminders (if futures).
+	•	Tavily integration (optional):
+	•	New module analyzers/sentiment_analysis.py using Tavily for targeted searches:
+	•	Queries per symbol + generic “crypto market”, deduped, with rate-limit & caching.
+	•	Outputs: sentiment_score [-1..1], top headlines (title, source, freshness), risk keywords.
+	•	Config flags: enable_tavily=true|false, tavily_max_requests_per_day, per-query time window.
+	•	Grok optionality:
+	•	llm_coordinator auto-detects GROK_API_KEY. If present, adds Grok to the vote/self-consistency ensemble; else runs without it.
+	•	New commands:
+	•	/brief — generate an on-demand brief now.
+	•	/brief schedule 07:00 — set local briefing time (with tz).
+	•	/brief symbols add BTCUSDT / /brief symbols list — manage brief coverage.
+	•	Safety:
+	•	News/sentiment cannot auto-trigger trades; it only adjusts bias/filters (e.g., block fade setups into major news).
+	•	Tavily results are logged/snapshotted for audit.
+
+Config additions (examples)
+
+.env adds:
+
+TAVILY_API_KEY=...
+TAVILY_ENABLE=true
+BRIEF_TIME_LOCAL=07:00
+BRIEF_TIMEZONE=Europe/Ljubljana
+
+config/market_settings.yaml adds:
+
+briefing:
+  enabled: true
+  time_local: "07:00"
+  timezone: "Europe/Ljubljana"
+  symbols: ["BTCUSDT","ETHUSDT"]   # default coverage
+  include_futures_calendar: true
+tavily:
+  enabled: true
+  freshness_days: 2
+  per_symbol_queries: 3
+  max_requests_per_day: 60
+  query_templates:
+    - "latest news {symbol} price drivers"
+    - "{symbol} funding, liquidation clusters, derivatives sentiment"
+    - "crypto market risk today macro events"
+
+Briefing message (Matrix) — sample
+
+[DAILY BRIEF] 2025-08-10 — Mode: Conservative — Symbols: BTCUSDT, ETHUSDT
+
+BTCUSDT
+• Trend/Levels: Price above EMA200 (5m/1h), range 60.8k–61.6k; ATR(14,5m)=150.
+• Liquidity: Spread 0.9 bps; 24h QuoteVol ↑12% vs 7d avg.
+• Setups Today: 
+  1) Mean reversion short near 61.6k (BB upper), SL 61.8k, TP 61.0k (R/R≈2).
+  2) Breakout long above 61.7k with retest; SL 61.45k, TP 62.3k.
+• Sentiment/News (Tavily): Slightly positive (+0.18). Headlines: 
+  - ETF inflows stabilize; miner selling slows (CoinDesk, 4h)
+  - Funding neutral; no major macro prints today (mixed sources)
+• Risk Flags: None major; watch funding flips; avoid fading strong 15m momentum post-US open.
+
+ETHUSDT
+• Trend/Levels: … (similar structure)
+Commands: /approve <id> when proposals appear, /brief to refresh, /mode aggressive, /halt
+
+
+MATRIX_HOMESERVER=https://chat.niflaire.com
+MATRIX_ADMIN_USERS=@aadmin:chat.niflaire.com 
+MATRIX_ROOM_IDS=!TmPuAOdJnukQPiuTBJ:chat.niflaire.com

@@ -1,0 +1,39 @@
+[Unit]
+Description=AI Trading Bot
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/home/trader/trader
+Environment=PATH=/home/trader/trader/venv/bin
+ExecStart=/home/trader/trader/venv/bin/python main.py
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=always
+RestartSec=5
+RestartPreventExitStatus=0
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/home/trader/trader
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-bot
+
+# Resource limits
+LimitNOFILE=65536
+MemoryHigh=1G
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target
